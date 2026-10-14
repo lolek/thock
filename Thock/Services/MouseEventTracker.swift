@@ -70,9 +70,16 @@ class MouseEventTracker {
             place: .tailAppendEventTap,
             options: .listenOnly,
             eventsOfInterest: eventMask,
-            callback: { _, type, event, _ in
-                if type.rawValue == 0xFFFFFFFE || type.rawValue == 0xFFFFFFFF {
-                    return nil
+            callback: { _, type, event, userInfo in
+                // Re-enable the tap if macOS disabled it, so mouse sounds don't stop silently.
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    if let userInfo = userInfo {
+                        let tracker = Unmanaged<MouseEventTracker>.fromOpaque(userInfo).takeUnretainedValue()
+                        if let tap = tracker.eventMonitor {
+                            CGEvent.tapEnable(tap: tap, enable: true)
+                        }
+                    }
+                    return Unmanaged.passUnretained(event)
                 }
                 
                 // Don't play if app is disabled
@@ -106,7 +113,7 @@ class MouseEventTracker {
                 
                 return Unmanaged.passUnretained(event)
             },
-            userInfo: nil
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
         )
         
         if let eventMonitor = eventMonitor {

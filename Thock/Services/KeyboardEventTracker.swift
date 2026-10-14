@@ -5,6 +5,7 @@ class KeyboardEventTracker {
     private var pressedKeys: Set<Int64> = []
     private var eventMonitor: CFMachPort?
     private var lastEventTime: Double = 0
+    private var watchdogTimer: Timer?
     
     deinit {
         stopTracking()
@@ -32,9 +33,14 @@ class KeyboardEventTracker {
             callback: { _, type, event, userInfo in
                 let tracker = Unmanaged<KeyboardEventTracker>.fromOpaque(userInfo!).takeUnretainedValue()
                 
-                if type.rawValue == 0xFFFFFFFE || type.rawValue == 0xFFFFFFFF {
-                    DispatchQueue.main.async { tracker.stopTracking() }
-                    return nil
+                // macOS disables the tap when the callback is too slow (tapDisabledByTimeout)
+                // or on certain user input (tapDisabledByUserInput). Previously the tracker
+                // stopped tracking here and keyboard sounds were lost until app restart.
+                // Re-enable the tap instead and reset key state, since key-up events may
+                // have been missed while the tap was disabled.
+                if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                    tracker.reenableTap()
+                    return Unmanaged.passUnretained(event)
                 }
                 
                 let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
@@ -111,13 +117,37 @@ class KeyboardEventTracker {
             let runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventMonitor, 0)
             CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
             CGEvent.tapEnable(tap: eventMonitor, enable: true)
+            startWatchdog()
         } else {
             print("Failed to create event tap.")
         }
     }
     
+    /// Re-enables the event tap after macOS disabled it and clears stale key state.
+    private func reenableTap() {
+        guard let eventMonitor = eventMonitor else { return }
+        pressedKeys.removeAll()
+        CGEvent.tapEnable(tap: eventMonitor, enable: true)
+    }
+    
+    /// Periodically verifies the tap is still enabled, as a safety net for cases
+    /// where the disable notification is never delivered.
+    private func startWatchdog() {
+        watchdogTimer?.invalidate()
+        let timer = Timer(timeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self = self, let eventMonitor = self.eventMonitor else { return }
+            if !CGEvent.tapIsEnabled(tap: eventMonitor) {
+                self.reenableTap()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        watchdogTimer = timer
+    }
+    
     /// Stops tracking key events and removes the event tap.
     func stopTracking() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
         if let eventMonitor = eventMonitor {
             CFMachPortInvalidate(eventMonitor)
             self.eventMonitor = nil
